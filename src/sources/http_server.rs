@@ -1,4 +1,4 @@
-use std::{collections::HashMap, net::SocketAddr};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use bytes::{Bytes, BytesMut};
 use chrono::Utc;
@@ -11,12 +11,16 @@ use vector_lib::{
         NewlineDelimitedDecoderConfig,
         decoding::{DeserializerConfig, FramingConfig},
     },
+    compile_vrl,
     config::{DataType, LegacyKey, LogNamespace},
     configurable::configurable_component,
     lookup::{lookup_v2::OptionalValuePath, owned_value_path, path},
     schema::Definition,
 };
-use vrl::value::{Kind, kind::Collection};
+use vrl::{
+    compiler::{CompilationResult, CompileConfig, Program, TypeState},
+    value::{Kind, kind::Collection},
+};
 use warp::http::HeaderMap;
 
 use crate::{
@@ -27,6 +31,7 @@ use crate::{
         SourceOutput,
     },
     event::Event,
+    format_vrl_diagnostics,
     http::KeepaliveConfig,
     serde::{bool_or_struct, default_decoding},
     sources::util::{
@@ -154,6 +159,23 @@ pub struct SimpleHttpConfig {
     #[serde(default = "default_http_response_code")]
     response_code: StatusCode,
 
+    /// A [VRL] program to generate the HTTP response sent back to the client.
+    ///
+    /// The program receives the decoded, enriched events where `.` is an array of event objects.
+    /// It must return either:
+    /// - A string, used directly as the response body with the configured `response_code`.
+    /// - An object with optional fields: `status` (integer), `body` (string), `headers` (object).
+    ///
+    /// [VRL]: https://vector.dev/docs/reference/vrl
+    #[configurable(metadata(
+        docs::examples = "encode_json({ \"ids\": map_values(.) -> |e| { e.id } })",
+        docs::examples = "parsed, err = parse_json(.[0].body)\nif err != null {\n  { \"status\": 400, \"body\": \"invalid JSON\" }\n} else {\n  { \"status\": 202, \"body\": encode_json(parsed), \"headers\": { \"x-request-id\": .[0].request_id } }\n}",
+        docs::examples = "row, err = get_enrichment_table_record(\"user_quota\", { \"user_id\": .[0].user_id })\nif err != null {\n  { \"status\": 404, \"body\": encode_json({ \"error\": \"unknown user id\" }) }\n} else {\n  remaining = row.value.quota_limit - row.value.events_used\n  if remaining <= 0 {\n    { \"status\": 429, \"body\": encode_json({ \"error\": \"quota exceeded\", \"limit\": row.value.quota_limit }) }\n  } else {\n    { \"status\": 202, \"body\": encode_json({ \"accepted\": true, \"remaining\": remaining }) }\n  }\n}",
+        docs::syntax_override = "remap_program"
+    ))]
+    #[serde(default)]
+    response_source: Option<String>,
+
     #[configurable(derived)]
     tls: Option<TlsEnableableConfig>,
 
@@ -280,6 +302,7 @@ impl Default for SimpleHttpConfig {
             host_key: default_host_key(),
             method: default_http_method(),
             response_code: default_http_response_code(),
+            response_source: None,
             strict_path: true,
             framing: None,
             decoding: Some(default_decoding()),
@@ -310,6 +333,30 @@ fn default_host_key() -> OptionalValuePath {
 
 const fn default_http_response_code() -> StatusCode {
     StatusCode::OK
+}
+
+fn compile_response_source(
+    source: &str,
+    enrichment_tables: &vector_lib::enrichment::TableRegistry,
+    metrics_storage: &vector_vrl_metrics::MetricsStorage,
+) -> crate::Result<Arc<Program>> {
+    let functions = vector_vrl_functions::all();
+    let state = TypeState::default();
+    let mut config = CompileConfig::default();
+    config.set_custom(enrichment_tables.clone());
+    config.set_custom(metrics_storage.clone());
+    let CompilationResult {
+        program, warnings, ..
+    } = compile_vrl(source, &functions, &state, config)
+        .map_err(|diags| format_vrl_diagnostics(source, diags))?;
+    if !warnings.is_empty() {
+        let warnings_str = format_vrl_diagnostics(source, warnings);
+        warn!(
+            message = "VRL response source compilation warning.",
+            warnings = %warnings_str
+        );
+    }
+    Ok(Arc::new(program))
 }
 
 /// Removes duplicates from the list, and logs a `warn!()` for each duplicate removed.
@@ -363,6 +410,12 @@ impl SourceConfig for SimpleHttpConfig {
             .build()?
             .with_log_namespace(log_namespace);
 
+        let response_source = self
+            .response_source
+            .as_deref()
+            .map(|s| compile_response_source(s, &cx.enrichment_tables, &cx.metrics_storage))
+            .transpose()?;
+
         let source = SimpleHttpSource {
             headers: build_param_matcher(&remove_duplicates(self.headers.clone(), "headers"))?,
             query_parameters: build_param_matcher(&remove_duplicates(
@@ -373,6 +426,7 @@ impl SourceConfig for SimpleHttpConfig {
             host_key: self.host_key.clone(),
             decoder,
             log_namespace,
+            response_source,
         };
         source.run(
             self.address,
@@ -421,9 +475,14 @@ struct SimpleHttpSource {
     host_key: OptionalValuePath,
     decoder: Decoder,
     log_namespace: LogNamespace,
+    response_source: Option<Arc<Program>>,
 }
 
 impl HttpSource for SimpleHttpSource {
+    fn response_source(&self) -> Option<Arc<Program>> {
+        self.response_source.clone()
+    }
+
     /// Enriches the log events with metadata for the `request_path` and for each of the headers.
     /// Non-log events are skipped.
     fn enrich_events(
@@ -604,6 +663,7 @@ mod tests {
                 encoding: None,
                 query_parameters,
                 response_code,
+                response_source: None,
                 tls: None,
                 auth,
                 strict_path,
@@ -682,6 +742,131 @@ mod tests {
             .unwrap()
             .status()
             .as_u16()
+    }
+
+    /// Spawn an `http_server` source with a `response_source` and return the bound address.
+    async fn source_with_program(
+        response_source: &str,
+        decoding: Option<DeserializerConfig>,
+    ) -> (impl Stream<Item = Event>, SocketAddr) {
+        let (sender, recv) = SourceSender::new_test_finalize(EventStatus::Delivered);
+        let (_guard, address) = next_addr();
+        let context = SourceContext::new_test(sender, None);
+        let program = response_source.to_owned();
+        tokio::spawn(async move {
+            SimpleHttpConfig {
+                address,
+                response_source: Some(program),
+                decoding,
+                ..SimpleHttpConfig::default()
+            }
+            .build(context)
+            .await
+            .unwrap()
+            .await
+            .unwrap();
+        });
+        wait_for_tcp(address).await;
+        (recv, address)
+    }
+
+    /// POST `body` and return the full reqwest Response (status + headers + body text).
+    async fn post_raw(address: SocketAddr, body: &str) -> reqwest::Response {
+        reqwest::Client::new()
+            .post(format!("http://{address}/"))
+            .body(body.to_owned())
+            .send()
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn response_source_string_return() {
+        assert_source_compliance(&HTTP_PUSH_SOURCE_TAGS, async {
+            let (rx, addr) = source_with_program(r#" "request received" "#, None).await;
+
+            spawn_collect_n(
+                async move {
+                    let resp = post_raw(addr, "hello\n").await;
+                    assert_eq!(resp.status().as_u16(), 200);
+                    assert_eq!(resp.text().await.unwrap(), "request received");
+                },
+                rx,
+                1,
+            )
+            .await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn response_source_object_custom_status_and_body() {
+        assert_source_compliance(&HTTP_PUSH_SOURCE_TAGS, async {
+            let program = r#"
+                {
+                    "status": 202,
+                    "body": encode_json({ "count": length(.) })
+                }
+            "#;
+            let (rx, addr) =
+                source_with_program(program, Some(JsonDeserializerConfig::default().into())).await;
+
+            spawn_collect_n(
+                async move {
+                    let resp = post_raw(addr, "{\"id\":1}\n{\"id\":2}\n").await;
+                    assert_eq!(resp.status().as_u16(), 202);
+                    let body: serde_json::Value =
+                        serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+                    assert_eq!(body["count"], 2);
+                },
+                rx,
+                2,
+            )
+            .await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn response_source_custom_response_headers() {
+        assert_source_compliance(&HTTP_PUSH_SOURCE_TAGS, async {
+            let program = r#"
+                {
+                    "body": encode_json({ "id": .[0].id }),
+                    "headers": { "X-Event-Id": to_string(.[0].id) }
+                }
+            "#;
+            let (rx, addr) =
+                source_with_program(program, Some(JsonDeserializerConfig::default().into())).await;
+
+            spawn_collect_n(
+                async move {
+                    let resp = post_raw(addr, "{\"id\": 42}\n").await;
+                    assert_eq!(resp.status().as_u16(), 200);
+                    assert_eq!(resp.headers()["x-event-id"], "42");
+                },
+                rx,
+                1,
+            )
+            .await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn response_source_invalid_vrl_fails_at_build() {
+        let result = SimpleHttpConfig {
+            address: "0.0.0.0:0".parse().unwrap(),
+            response_source: Some("this is not valid vrl !!!".to_owned()),
+            ..SimpleHttpConfig::default()
+        }
+        .build(SourceContext::new_test(
+            SourceSender::new_test_finalize(EventStatus::Delivered).0,
+            None,
+        ))
+        .await;
+
+        assert!(result.is_err(), "invalid VRL should fail at build time");
     }
 
     async fn send_bytes(address: SocketAddr, body: Vec<u8>, headers: HeaderMap) -> u16 {

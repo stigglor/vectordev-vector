@@ -706,6 +706,42 @@ generated: components: sources: http_server: configuration: {
 			]
 		}
 	}
+	response_source: {
+		description: """
+			A [VRL] program to generate the HTTP response sent back to the client.
+
+			The program receives the decoded, enriched events where `.` is an array of event objects.
+			It must return either:
+			- A string, used directly as the response body with the configured `response_code`.
+			- An object with optional fields: `status` (integer), `body` (string), `headers` (object).
+
+			[VRL]: https://vector.dev/docs/reference/vrl
+			"""
+		required: false
+		type: string: {
+			examples: ["encode_json({ \"ids\": map_values(.) -> |e| { e.id } })", """
+				parsed, err = parse_json(.[0].body)
+				if err != null {
+				  { "status": 400, "body": "invalid JSON" }
+				} else {
+				  { "status": 202, "body": encode_json(parsed), "headers": { "x-request-id": .[0].request_id } }
+				}
+				""", """
+				row, err = get_enrichment_table_record("user_quota", { "user_id": .[0].user_id })
+				if err != null {
+				  { "status": 404, "body": encode_json({ "error": "unknown user id" }) }
+				} else {
+				  remaining = row.value.quota_limit - row.value.events_used
+				  if remaining <= 0 {
+				    { "status": 429, "body": encode_json({ "error": "quota exceeded", "limit": row.value.quota_limit }) }
+				  } else {
+				    { "status": 202, "body": encode_json({ "accepted": true, "remaining": remaining }) }
+				  }
+				}
+				"""]
+			syntax: "remap_program"
+		}
+	}
 	strict_path: {
 		description: """
 			Whether or not to treat the configured `path` as an absolute path.

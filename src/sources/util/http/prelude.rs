@@ -1,4 +1,6 @@
-use std::{collections::HashMap, convert::Infallible, fmt, net::SocketAddr, time::Duration};
+use std::{
+    collections::HashMap, convert::Infallible, fmt, net::SocketAddr, sync::Arc, time::Duration,
+};
 
 use bytes::Bytes;
 use futures::{FutureExt, TryFutureExt};
@@ -7,9 +9,13 @@ use tokio::net::TcpStream;
 use tower::ServiceBuilder;
 use tracing::Span;
 use vector_lib::{
-    EstimatedJsonEncodedSizeOf,
+    EstimatedJsonEncodedSizeOf, TimeZone,
     config::SourceAcknowledgementsConfig,
-    event::{BatchNotifier, BatchStatus, BatchStatusReceiver, Event},
+    event::{BatchNotifier, BatchStatus, BatchStatusReceiver, Event, EventMetadata, VrlTarget},
+};
+use vrl::{
+    compiler::{Program, runtime::Runtime},
+    value::Value,
 };
 use warp::{
     Filter,
@@ -19,6 +25,7 @@ use warp::{
     },
     http::{HeaderMap, StatusCode},
     reject::Rejection,
+    reply::Reply,
 };
 
 use super::encoding::decompress_body;
@@ -35,6 +42,13 @@ use crate::{
 };
 
 pub trait HttpSource: Clone + Send + Sync + 'static {
+    /// Optional compiled VRL program used to generate the HTTP response body.
+    /// The default returns `None`, meaning the source responds with the configured status code
+    /// and an empty body. Override this in implementations that support `response_source`.
+    fn response_source(&self) -> Option<Arc<Program>> {
+        None
+    }
+
     // This function can be defined to enrich events with additional HTTP
     // metadata. This function should be used rather than internal enrichment so
     // that accurate byte count metrics can be emitted.
@@ -169,7 +183,14 @@ pub trait HttpSource: Clone + Send + Sync + 'static {
                                 events
                             });
 
-                        handle_request(events, acknowledgements, response_code, cx.out.clone())
+                        let response_source = self.response_source();
+                        handle_request(
+                            events,
+                            acknowledgements,
+                            response_code,
+                            response_source,
+                            cx.out.clone(),
+                        )
                     },
                 );
 
@@ -255,12 +276,17 @@ async fn handle_request(
     events: Result<Vec<Event>, ErrorMessage>,
     acknowledgements: bool,
     response_code: StatusCode,
+    response_source: Option<Arc<Program>>,
     mut out: SourceSender,
-) -> Result<impl warp::Reply, Rejection> {
+) -> Result<warp::reply::Response, Rejection> {
     match events {
         Ok(mut events) => {
-            let receiver = BatchNotifier::maybe_apply_to(acknowledgements, &mut events);
+            let response = match response_source {
+                Some(ref program) => build_vrl_response(&events, program, response_code)?,
+                None => response_code.into_response(),
+            };
 
+            let receiver = BatchNotifier::maybe_apply_to(acknowledgements, &mut events);
             let count = events.len();
             out.send_batch(events)
                 .map_err(|_| {
@@ -269,7 +295,7 @@ async fn handle_request(
                     emit!(StreamClosedError { count });
                     warp::reject::custom(RejectShuttingDown)
                 })
-                .and_then(|_| handle_batch_status(response_code, receiver))
+                .and_then(|_| handle_batch_status(response, receiver))
                 .await
         }
         Err(error) => {
@@ -280,13 +306,13 @@ async fn handle_request(
 }
 
 async fn handle_batch_status(
-    success_response_code: StatusCode,
+    success_response: warp::reply::Response,
     receiver: Option<BatchStatusReceiver>,
-) -> Result<impl warp::Reply, Rejection> {
+) -> Result<warp::reply::Response, Rejection> {
     match receiver {
-        None => Ok(success_response_code),
+        None => Ok(success_response),
         Some(receiver) => match receiver.await {
-            BatchStatus::Delivered => Ok(success_response_code),
+            BatchStatus::Delivered => Ok(success_response),
             BatchStatus::Errored => Err(warp::reject::custom(ErrorMessage::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Error delivering contents to sink".into(),
@@ -296,5 +322,82 @@ async fn handle_batch_status(
                 "Contents failed to deliver to sink".into(),
             ))),
         },
+    }
+}
+
+fn build_vrl_response(
+    events: &[Event],
+    program: &Program,
+    default_status: StatusCode,
+) -> Result<warp::reply::Response, Rejection> {
+    let event_values: Vec<Value> = events
+        .iter()
+        .filter_map(|e| e.maybe_as_log())
+        .map(|log| log.value().clone())
+        .collect();
+
+    let target_value = Value::Array(event_values);
+    let mut target = VrlTarget::LogEvent(target_value, EventMetadata::default());
+
+    match Runtime::default().resolve(&mut target, program, &TimeZone::default()) {
+        Err(err) => {
+            emit!(HttpInternalError {
+                message: &format!("VRL response program failed: {err}")
+            });
+            Err(warp::reject::custom(ErrorMessage::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("VRL response program failed: {err}"),
+            )))
+        }
+        Ok(Value::Bytes(body)) => warp::http::Response::builder()
+            .status(default_status)
+            .body(hyper::Body::from(body))
+            .map_err(|err| {
+                warp::reject::custom(ErrorMessage::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to build response: {err}"),
+                ))
+            }),
+        Ok(Value::Object(obj)) => {
+            let status = obj
+                .get("status")
+                .and_then(|v| v.as_integer())
+                .and_then(|n| StatusCode::from_u16(n as u16).ok())
+                .unwrap_or(default_status);
+
+            let body = obj
+                .get("body")
+                .map(|v| match v {
+                    Value::Bytes(b) => hyper::Body::from(b.clone()),
+                    other => hyper::Body::from(other.to_string()),
+                })
+                .unwrap_or_else(hyper::Body::empty);
+
+            let mut builder = warp::http::Response::builder().status(status);
+
+            if let Some(Value::Object(headers)) = obj.get("headers") {
+                for (k, v) in headers {
+                    if let Value::Bytes(v) = v {
+                        builder = builder.header(k.as_str(), v.as_ref());
+                    }
+                }
+            }
+
+            builder.body(body).map_err(|err| {
+                warp::reject::custom(ErrorMessage::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to build response: {err}"),
+                ))
+            })
+        }
+        Ok(other) => {
+            emit!(HttpInternalError {
+                message: "VRL response program returned unexpected type"
+            });
+            Err(warp::reject::custom(ErrorMessage::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("VRL response program must return a string or object, got: {other:?}"),
+            )))
+        }
     }
 }
